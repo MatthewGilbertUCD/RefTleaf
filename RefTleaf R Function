@@ -1,0 +1,348 @@
+###################################################
+### RefTleaf - Reference leaf temperature model ###
+###################################################
+# described in Supplementary Material of TO BE ADDED AFTER ACCEPTANCE
+# If used, please cite the main paper: DOI TO BE ADDED AFTER ACCEPTANCE
+# for more information contact megilbert@ucdavis.edu
+
+###########
+# Summary #
+###########
+# Use: The RefTleaf function allows a user to input weather measurements and predict leaf responses (temperature and transpiration rates)
+# Operation: The RefTleaf function finds the Tleaf that balances the heat gain and losses of the leaf given the provided weather inputs
+# Assumption 1: The reference temperature model, as implemented, assumes that the leaf is horizontal
+# Assumption 2: The reference leaf does not influence its environment, but the model will work for any weather dataset that measures realistic data i.e., the model will predict temperature of a shaded leaf, provided the conditions under shade were measured
+# Weather Inputs: a complete set of seven thermal and radiation variables is needed: 
+  # WS - wind speed; m/s (ideally from a sonic anemometer measuring <0.5 m/s, or the hourly value from a cup anemometer)
+  # Tair - air temperature; oC
+  # RH - Relative humidity; %
+  # net radiometer outputs:
+    # LWRup - IR or longwave radiation emitted and reflected from a surface upwards; W/m^2
+    # LWRdown - IR or longwave radiation sourced from the sky i.e. downwelling; W/m^2
+    # SWRup - solar or shortwave radiation sourced from below the leaf i.e. reflection; W/m^2
+    # SWRdown - solar or shortwave radiation sourced from the sky i.e. downwelling; W/m^2
+    # CAUTION: when using certain sensors the term "up" can to refer to the radiation component coming from the upwards direction (sky)
+      # here we define "up" as the direction of radiation movement i.e. SWRup is reflected radiation 
+    # Note that the net radiometer values can be calculated from the formulae given in the published paper
+
+# Optional Leaf and Soil Parameter Inputs: these are set at default values and do not need to be set; setting these over-rides the defaults
+    # drought=0 i.e. no drought stomatal conductance is modeled; a value of 1 sets the stomata closed
+    # d=0.05 m i.e. leaf characteristic dimension ~ width
+    # emisleaf=0.96 i.e. an IR emissivity of close to 1; values given on pg 59 of Campbell 1977 and by Gates 1964 Table 1
+    # aLWR=0.96 long-wave absorptance; by Kirchoffs law the absorptance and emissivity to longwave radiation (LWR) are the same 
+    # aSWR=0.50 short-waver absorptance; e.g. Gates 1964 Table 1. Average for 22 US species is 0.51 for upper surface and 0.47 for lower (Birkebak and Birkebak 1964)
+    # gcuticular = 0.02 mol m-2 s-1 cuticular conductance ~ 831 s/m resistance of the leaf when stomata are closed i.e. cuticular resistance
+    # psi_soil = 0 MPa soil water potential; default is approx. the soil water potential for an irrigated tree 
+    # psi_min = -1.5 MPa is the leaf water potential at which stomata close i.e. turgor loss point
+    # kplant = 2 mmol m-2 s-1 MPa-1 the plant hydraulic conductance to use in the stomata equation 
+    # PPFDo = 10 micromols m-2 s-1, the stomatal photosynthetic photon flux density (PPFD) offset; 
+    # Phi = 0.001 is the slope of the PPFD stomatal opening response
+    # gswset = NA mol m-2 s-1; if used this will override the stomatal model and set a constant value for gsw
+    
+# Outputs: a data frame that includes the predicted leaf temperature (Tleaf) and all the inputs and heat exchange variables
+  # example outputs:
+    # flag - a flag variable: 0 if the optimization converged on a result, and 1 if convergence did not occur (an unreliable outcome)
+    # Emmols - the predicted transpiration rate; mmol m-2 s-1
+    # H, LE, LWRout and other heat exchange values for the leaf; W m-2
+    # all variables are defined at first instance in the function
+
+# Examples: examples of the function are provided below the function definition
+  
+
+RefTleaf=function(WS,Tair,RH,LWRup,LWRdown,SWRup,SWRdown,drought=0,d=0.05,emisleaf=0.96,aLWR=0.96,aSWR=0.50,gcuticular=0.02,psi_soil=0,psi_min=-1.5,kplant=10,PPFDo=10,Phi=0.001,gswset=NA){
+
+  # convert values to numeric in case not
+  WS=as.numeric(WS)
+  Tair=as.numeric(Tair)
+  RH=as.numeric(RH)
+  LWRup=as.numeric(LWRup)
+  LWRdown=as.numeric(LWRdown)
+  SWRup=as.numeric(SWRup)
+  SWRdown=as.numeric(SWRdown)
+  d=as.numeric(d)
+  emisleaf=as.numeric(emisleaf)
+  aLWR=as.numeric(aLWR)
+  aSWR=as.numeric(aSWR)
+  gcuticular=as.numeric(gcuticular)
+  psi_soil=as.numeric(psi_soil)
+  psi_min=as.numeric(psi_min)
+  kplant=as.numeric(kplant)
+  PPFDo=as.numeric(PPFDo)
+  Phi=as.numeric(Phi)
+  gswset=as.numeric(gswset)  
+
+    
+  # universal constants
+        SB=5.67*10^-8 # W m-2 K-4 Stefan-Boltzmann constant
+        g= 9.81 # m s-2  gravitational constant
+        AtmPress = 101.35 # kPa is the default atmospheric pressure; note that most parameters as calculated below currently have no pressure correction, so changing this is not advised 
+        
+  # vapor pressures for bulk air in mmol mol-1 units
+        esatTair=0.61365*exp((17.502*Tair)/(240.97+Tair)) # Buck 1981 in kPa
+        esatTair=1000*esatTair/AtmPress  # convert to mmol mol-2 units 
+        ea=esatTair*RH/100
+        # calcs for converting leaf conductance in mol units to resistance in s m-1 units
+        rstconv=AtmPress/(0.00831446*(Tair+273.15)) # Nobel  
+        
+  # energy balance left hand side (energy gains) which are not affected by leaf temperature
+        gains=aSWR*SWRup+aSWR*SWRdown+aLWR*LWRup+aLWR*LWRdown
+  
+  # net energy balance of losses-gains
+      # the netEB subfunction allows the main function to use the optim function to find the Tleaf that has heat gains=losses
+      # the netEB function inherits the inputs above  
+      netEB=function(Tleaf){
+          # calcs for the vapor pressure in the leaf and vapor pressure deficit
+          eleaf=0.61365*exp((17.502*Tleaf)/(240.97+Tleaf)) # Buck 1981 in kPa
+          eleaf=1000*eleaf/AtmPress  # convert to mmol mol-2 units 
+        
+          VPD=eleaf-ea # mmol mol-1 this VPD assumes a greater gradient than experienced by a leaf i.e., including the boundary layer, as widely implemented in many stomatal models. 
+          # Stomatal model (gsw) based upon a derivation of Buckley et al 2012 eqn 1, which is then used to calculate total surface conductance (gtw) 
+                # PPFD or light response 
+                    # the response is scaled from 0-1 so no explicit max parameter is needed
+                    PPFD=SWRdown*2 # an approximate conversion of incident solar radiation to PPFD
+                    b=(1+Phi*PPFD)/(1*Phi*(PPFD+PPFDo))
+
+                # constraints have been added relative to original BMF model: 
+                    #1) a cuticular conductance, so that total conductance under turgor loss remains at a cuticular value
+                    #2) a pmax() function to prevent conductance going below zero
+                    #3) the "b" function here is a lumped response to PPFD, and replaces the inverse of the chi*alpha in eqn 1 of Buckley et al 2012
+                    #4) if statements to overide the default values
+                if(drought==1){psi_soil=psi_min} # this forces stomatal closure if the plant is drought stressed; alternatively a value for psi_soil representing drought conditions could be input to the main function
+                gsw=pmax((kplant*(psi_soil-psi_min))/(kplant*b+VPD),0)
+                # if gswset = NA then nothing happens, if not, then gtw is reset with the indicated value of gswset; this allows the user to set gsw to a specific value if they want
+                if(!is.na(gswset)){gtw=gswset+gcuticular}else{gtw=gsw+gcuticular}
+                # convert to surface resistance
+                rsurface=rstconv/(gtw)
+          # boundary layer resistance (rbl) calcs largely based upon Monteith and Unsworth 2013 (Ch 10) 
+                if(WS<0.001){WS=0.001} # this is to avoid the case where WS=0 and thus Re=0 and the Ri ratio is undefined
+                # calculations of air characteristics for the average of leaf and air temperature
+                    L=-2.373*(Tleaf+Tair)/2+2500.8 # J g-1 latent heat of evaporation
+                    y=(0.06364*(Tleaf+Tair)/2+64.58)/1000 #kPa K-1 psychrometric constant
+                    v=(0.09*(Tleaf+Tair)/2+13.29)*10^-6 #m2 s-1 kinematic viscosity of dry air from Appendix A3 Montieth and Unsworth (2013); 
+                    # p= -0.00411*(Tleaf+Tair)/2+1.28976 # kg m-3 density of dry air from Appendix A3 Montieth and Unsworth (2013)
+                    p = 3.480*AtmPress/((Tair+Tleaf)/2+273.15) # density of air; kg / m3 based upon eqn 16 of Foster and Smith (1986) but converted to kg units; similar results to Appendix A3 Montieth and Unsworth (2013)
+                    K= (0.1324*(Tleaf+Tair)/2+18.88)*10^-6 #m2 s-1 thermal diffusivity of dry air from Appendix A3 Montieth and Unsworth (2013)
+                    a= (-0.0122*(Tleaf+Tair)/2+3.687)*10^-3  # K-1 coefficient of thermal expansion of air at 1 atm
+                    Cp=1010 # J kg-1 K-1 heat capacity of air
+                    Re=WS*d/v # Reynolds number; dimensionless; calculation realistic based upon Example 10.1.6.1 in Monteith and Unsworth (2013)
+                    Gr=a*g*(d^3)*(Tleaf-Tair)/(v^2)  # Grashof number; dimensionless; 
+                    Ri = Gr/(Re^2) # Richardson or Archimedes number; buoyancy divided by viscous forces; dimensionless 
+                # based upon the Re, Gr, Ri values calculated above, we need to find the correct state of the air flow over the leaf and use known relationships to calculate boundary layer resistance. This approach is largely from: Monteith and Unsworth 2013
+                    # Forced convection
+                        #A=0.60 and n =0.5 if laminar Re<= 2*10^4
+                        #A=0.32 and n = 0.8 if turbulent Re>2*10^4
+                        A=0.60
+                        n=0.5
+                        Nulaminar=A*Re^n # A and n are constants from Monteith and Unsworth 2013 Appendix A.5
+                        A=0.032
+                        n=0.8
+                        Nuturbulent=A*Re^n
+                        if(Re<= 2*10^4){
+                          Nuforced=Nulaminar
+                        }else{
+                          Nuforced=Nuturbulent
+                        }
+                    
+                    # Free convection
+                        # B= 0.50 and m = 0.25 if laminar Gr <= 10^5
+                        # B=0.13 and m = 0.33 if turbulent Gr > 10^5
+                        if(Gr<= 10^5){
+                          B=0.5
+                          m=0.25
+                        }else{
+                          B=0.13
+                          m=0.33
+                        }
+                        Nufree=B*Gr^m
+                    
+                    #Mixed if 0.1<Ri<16
+                        if(Ri<16 & Ri>0.1){
+                          # mixed
+                          # Monteith and Unsworth (2013) don't provide clear guidance on mixed conditions, but refer to Schuepp (1993), who uses this calculation:
+                          Nuforced=sqrt((Nulaminar^2+Nuturbulent^2))
+                          Nu=(Nufree^3.5+Nuforced^3.5)^(1/3.5)
+                         }else{
+                          if(Ri<= 0.1){
+                            # forced
+                            Nu=Nuforced
+                          }
+                          if(Ri>= 16){ # Gates 2003 and Okajima et al 2012 use a threshold of 16; Schuepp uses 16 too.
+                            # free
+                            Nu=Nufree
+                          }
+                        }
+                # the above steps have found the correct Nu number for the air flow regime over the leaf
+                # boundary layer resistance for heat:
+                    rblH=d/(1.4*K*Nu)  # s m-1; units checked; 1.4 is the enhancement factor for conductance mentioned in Monteith and Unsworth, but used by other authors
+                # leaf convection:
+                    H = 2*p*Cp*(Tleaf-Tair)/rblH # W m-2; Monteith and Unsworth eqn 10.3;
+            
+        # other calcs
+            # total leaf resistance including aerodynamic
+            rtotal=rsurface+rblH/0.93 # the 0.93 is the conversion of heat to vapor suggested by Monteith and Unsworth 2013; 
+            # latent heat loss (evaporative cooling)
+            VPDkPa=(eleaf-ea)*AtmPress/1000
+            LE=(p*Cp/y)*(VPDkPa)/(rtotal) # W m^-2
+            Emmhr=3600*LE/(L*1000) # transpiration in mm hr^-1 units
+            Emmols=(LE/L*1000)*(1/18.015) # transpiration in mol units
+            LWRout=2*emisleaf*SB*(Tleaf+273.15)^4 # leaf IR or longwave emission from both sides
+            losses=LE+H+LWRout # total losses of heat from the leaf
+            # net.sqd is the main output variable from the netEB subfunction; this is the variable that is solved/optimised to find the Tleaf at which gains=losses
+            net.sqd=(losses-gains)^2 # squared value for numerical solver
+            # defines a temporary output dataframe
+            out=data.frame(net.sqd,Tleaf,losses,LE,H,LWRout,eleaf,Emmhr,Emmols,rsurface,rblH,Nu,Re,Gr,Ri)
+            colnames(out)=c("net.sqd","Tleaf","losses","LE","H","LWRout","eleaf","Emmhr","Emmols","rsurface","rblH","Nu","Re","Gr","Ri")
+            return(out)
+      } # end of netEB function definition
+  
+      
+      # this is a helper function so allows use of optim to solve netEB function i.e., optim can only solve if there is one output
+      netEB.helper=function(Tleaf){
+        out=netEB(Tleaf)
+        return(out[1])
+      } # end helper function
+  
+  # solving; flag 0 indicates that the solution is good i.e., the solver converged on an answer
+        # use optim to find the Tleaf that results in net.sqd being zero
+        output=optim(par=c(Tleaf=Tair),netEB.helper,method="L-BFGS-B",lower=c(-10),upper=c(90))
+        # if optim output doesn't converge flag=1
+        Tleaf <- as.numeric(output$par)
+        flag=output$convergence 
+  
+  # recalculating outputs depending on numerical solution
+        out=netEB(Tleaf)
+        net.sqd=out$net.sqd
+        losses=out$losses
+        LE=out$LE
+        H=out$H
+        LWRout=out$LWRout
+        eleaf=out$eleaf
+        Emmhr=out$Emmhr
+        Emmols=out$Emmols
+        rsurface=out$rsurface
+        rblH=out$rblH
+        Nu=out$Nu
+        Re=out$Re
+        Gr=out$Gr
+        Ri=out$Ri
+        gsurface=rstconv/rsurface
+                
+  # create output dataframe and return it      
+  out=data.frame(Tleaf,flag,drought,gains,losses,LE,H,LWRout,Emmols,Emmhr,eleaf,esatTair,ea,WS,Tair,RH,LWRup,LWRdown,SWRup,SWRdown,d,emisleaf,aLWR,aSWR,rsurface,gsurface,rblH,Nu,Re,Gr,Ri,psi_soil,psi_min,kplant,PPFDo,Phi)
+  colnames(out)=c("Tleaf","flag","drought","gains","losses","LE","H","LWRout","Emmols","Emmhr","eleaf","esatTair","ea","WS","Tair","RH","LWRup","LWRdown","SWRup","SWRdown","d","emisleaf","aLWR","aSWR","rsurface","gsurface","rblH","Nu","Re","Gr","Ri","psi_soil","psi_min","kplant","PPFDo","Phi")
+  # the output is a single line of a dataframe containing all the information (inputs and outputs).
+  return(out)
+
+} # end function RefTleaf function
+
+
+
+
+######################################
+### Function test and illustration ###
+######################################
+
+# Inputs
+Tair=40 #oC
+RH=20 # %
+SWRdown=1000 # W m-2 incoming solar
+SWRup=300 # W m-2 reflection
+WS=0.25# m s-1 wind speed
+LWRup=400 # W m-2 IR or longwave radiation from ground surface
+LWRdown=300 # W m-2 IR or longwave radiation from above (sky)
+
+# Function outputs
+# an irrigated leaf:
+RefTleaf(WS,Tair,RH,LWRup,LWRdown,SWRup,SWRdown)
+
+# the same leaf under drought (stomatal closure conditions)
+RefTleaf(WS,Tair,RH,LWRup,LWRdown,SWRup,SWRdown,drought=1)
+
+# the same leaf under drought, but thinner ~0.5 mm wide
+RefTleaf(WS,Tair,RH,LWRup,LWRdown,SWRup,SWRdown,drought=1,d=0.005)
+
+
+######################################################
+# Illustrative plot of response to a single variable #
+######################################################
+
+# Inputs
+Tair=40 #oC
+RH=20 # %
+SWRdown=1000 # W m-2 incoming solar
+SWRup=200# W m-2 reflection
+WS=0.25 # m s-1 wind speed
+LWRup=600 # W m-2 IR or longwave radiation from ground surface
+LWRdown=400 # W m-2 IR or longwave radiation from above (sky)
+
+
+#### model response to Rsolar
+      #This sets the variable values you are simulating i.e., xs are a vector of the values of a variable e.g. Rsolar
+      xs=seq(0,1000,by=20)
+      # a plot of just the first point
+      plot(-100~1,ylim=c(-10,20),
+           xlim=c(min(xs),max(xs)),
+           xlab=expression(R[solar]~~(W~m^-2)),
+           ylab=expression(T[leaf]~-~T[air]~(""^o*C)~or~other),
+           main="Solar radiation response, irrigated plant") # end of plot call
+      
+      # further additions to the plot 
+      abline(a=0,b=0) # a x-axis line
+      for(i in xs){
+          # if you change the variable being plotted then change the "i" in the formula below
+          results=RefTleaf(WS,Tair,RH,LWRup,LWRdown,SWRup,SWRdown=i,drought=0)
+          points((results[1,]$Tleaf-Tair)~i,type="p",col="green",pch=24)
+          points(results[1,]$Emmols~i,type="p",col="blue",pch=24)
+          points(results[1,]$gsurface*10~i,type="p",col="magenta",pch=24) 
+      } # end for loop
+      
+      # this plots a legend, but be sure to specify the right colors and names
+      legend("bottomright",legend=c(expression(T[leaf]~-~T[air]),expression(Transpiration~(mmol~m^-2~s^-1)),expression(10~x~g[surface])),col=c("green","blue","magenta"),pch=c(24))
+      
+#### model response to Tair
+      #This sets the variable values you are simulating i.e., xs are a vector of the values of a variable e.g. Rsolar
+      xs=seq(0,50,by=1)
+      # a plot of just the first point
+      plot(-100~1,ylim=c(-10,20),
+           xlim=c(min(xs),max(xs)),
+           xlab=expression(T[air]~(""^o*C)),
+           ylab=expression(T[leaf]~-~T[air]~(""^o*C)~or~other),
+           main="Air temperature response, irrigated plant") # end of plot call
+      
+      # further additions to the plot 
+      abline(a=0,b=0) # a x-axis line
+      for(i in xs){
+        # if you change the variable being plotted then change the "i" in the formula below
+        results=RefTleaf(WS,Tair=i,RH,LWRup,LWRdown,SWRup,SWRdown,drought=0)
+        points((results[1,]$Tleaf-i)~i,type="p",col="green",pch=24)
+        points(results[1,]$Emmols~i,type="p",col="blue",pch=24)
+        points(results[1,]$gsurface*10~i,type="p",col="magenta",pch=24) 
+      } # end for loop
+      
+      # this plots a legend, but be sure to specify the right colors and names
+      legend("bottomright",legend=c(expression(T[leaf]~-~T[air]),expression(Transpiration~(mmol~m^-2~s^-1)),expression(10~x~g[surface])),col=c("green","blue","magenta"),pch=c(24))
+      
+      
+  #### model response to soil water potential
+      #This sets the variable values you are simulating i.e., xs are a vector of the values of a variable e.g. Rsolar
+      xs=seq(0,-2,by=-0.02)
+      # a plot of just the first point
+      plot(-100~1,ylim=c(-10,20),
+           xlim=c(min(xs),max(xs)),
+           xlab=expression(Soil~water~potential~(MPa)),
+           ylab=expression(T[leaf]~-~T[air]~(""^o*C)~or~other),
+           main="Soil water potential response") # end of plot call
+      
+      # further additions to the plot 
+      abline(a=0,b=0) # a x-axis line
+      for(i in xs){
+        # if you change the variable being plotted then change the "i" in the formula below
+        results=RefTleaf(WS,Tair,RH,LWRup,LWRdown,SWRup,SWRdown,psi_soil=i)
+        points((results[1,]$Tleaf-Tair)~i,type="p",col="green",pch=24)
+        points(results[1,]$Emmols~i,type="p",col="blue",pch=24)
+        points(results[1,]$gsurface*10~i,type="p",col="magenta",pch=24) 
+      } # end for loop
+      
+      # this plots a legend, but be sure to specify the right colors and names
+      legend("bottomright",legend=c(expression(T[leaf]~-~T[air]),expression(Transpiration~(mmol~m^-2~s^-1)),expression(10~x~g[surface])),col=c("green","blue","magenta"),pch=c(24))
+      
